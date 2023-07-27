@@ -1,217 +1,133 @@
-use std::{collections::HashMap, io};
-
-type Result<T> = io::Result<T>;
-
-trait MufieldT: Sized {
-    fn enc<W: io::Write>(&self, w: &mut W) -> Result<()>;
-    fn dec<R: io::Read>(r: &mut R) -> Result<Self>;
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MufieldIdx(usize);
-#[derive(Debug)]
-struct MubyteIdx(usize);
-
-enum SizeData {
-    Exact(usize),
-    Unsized(UnknownSizeData),
-}
+use std::io;
 
 #[derive(Debug)]
-enum AllSizes {
-    Finite(Vec<usize>),
-    Infinite,
+pub enum MuError {
+    Io(std::io::Error),
+    StarveMin(usize),
 }
 
-struct UnknownSizeData {
-    /// My sizer fields
-    mysz: Vec<MufieldIdx>,
-    // sizes: AllSizes<Box<dyn Iterator<Item = usize>>>,
-    sizes: AllSizes,
-    /// Function which determines the size of this field depending on the sizers
-    size_fn: fn(&Mudata, &[MufieldIdx]) -> usize,
-}
+pub type DecResult<T> = std::result::Result<T, MuError>;
 
-struct Mufield {
-    /// Name of field
-    name: &'static str,
-    /// Is this field a sizer for another field?
-    isz: Option<MufieldIdx>,
-    /// Size information about this field
-    sz: SizeData,
-    /// Indexes into the mudata array for each byte, in order.
-    byteidx: Vec<MubyteIdx>,
-}
-
-struct Mufmt {
-    fields: Vec<Mufield>,
-}
-
-#[derive(Clone)]
-struct Mudata {
-    bytes: Vec<(MufieldIdx, u8)>,
-}
-
-trait Mu {
-    fn mufmt() -> Mufmt;
-    fn mudata(&self) -> Mudata;
-    fn muaccept(mudata: MudataInput) -> Result<Self>
-    where
-        Self: Sized;
+pub trait MufieldT: Sized {
+    fn enc<W: io::Write>(&self, w: &mut W) -> io::Result<()>;
+    fn dec<R: io::Read>(r: &mut R) -> DecResult<Self>;
 }
 
 struct Hello {
     byte: u8,
-    flag: bool,
-    /// Exists only if `flag` is set to true.
     maybe_exists: Option<u8>,
 }
 
-struct MudataInput {
-    map: HashMap<&'static str, Vec<u8>>,
-}
-
-fn hello_maybe_exists_szfn(data: &Mudata, fieldidx: &[MufieldIdx]) -> usize {
-    let (_, byte) = data.bytes[fieldidx[0].0];
-    /*if byte != 0 {
-        1
-    } else {
-        0
-    }*/
-    byte as usize
-}
-
-impl Mu for Hello {
-    fn mufmt() -> Mufmt {
-        Mufmt {
-            fields: vec![
-                Mufield {
-                    name: "byte",
-                    isz: None,
-                    sz: SizeData::Exact(1),
-                    byteidx: vec![MubyteIdx(0)],
-                },
-                Mufield {
-                    name: "flag",
-                    isz: Some(MufieldIdx(2)),
-                    sz: SizeData::Exact(1),
-                    byteidx: vec![MubyteIdx(1)],
-                },
-                Mufield {
-                    name: "maybe_exists",
-                    isz: None,
-                    sz: SizeData::Unsized(UnknownSizeData {
-                        mysz: vec![MufieldIdx(1)],
-                        size_fn: hello_maybe_exists_szfn,
-                        sizes: AllSizes::Finite(vec![0, 1]),
-                    }),
-                    byteidx: vec![MubyteIdx(2)],
-                },
-            ],
-        }
+impl MufieldT for u8 {
+    fn dec<R: io::Read>(r: &mut R) -> DecResult<Self> {
+        let mut b = [0; 1];
+        r.read_exact(&mut b).map_err(MuError::Io)?;
+        Ok(b[0])
     }
 
-    fn mudata(&self) -> Mudata {
-        Mudata {
-            bytes: vec![
-                (MufieldIdx(0), self.byte),
-                (MufieldIdx(1), self.flag as u8),
-                (MufieldIdx(2), self.maybe_exists.unwrap_or(0)),
-            ],
-        }
-    }
-
-    fn muaccept(input: MudataInput) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let byte = input.map["byte"][0];
-        let flag = input.map["flag"][0] != 0;
-        let maybe_exists = if flag {
-            Some(input.map["maybe_exists"][0])
-        } else {
-            assert_eq!(input.map["maybe_exists"].len(), 0);
-            None
-        };
-        Ok(Hello {
-            byte,
-            flag,
-            maybe_exists,
-        })
+    fn enc<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&[*self])
     }
 }
 
-enum MaxLen {
-    Infinite,
-    Finite(usize),
+impl MufieldT for bool {
+    fn enc<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        let b = *self as u8;
+        u8::enc(&b, w)
+    }
+
+    fn dec<R: io::Read>(r: &mut R) -> DecResult<Self> {
+        let b = u8::dec(r)?;
+        Ok(b != 0)
+    }
 }
 
-fn max_len(fmt: Mufmt) -> MaxLen {
-    MaxLen::Finite(fmt.fields.iter().map(|f| f.byteidx.len()).sum())
-}
-
-/// Encode the struct into a stream of bytes
-fn pack<M: Mu>(struct_: M) -> Vec<u8> {
-    // Not worth trying to determine capacity before speed-wise
-    // (I think, didn't verify)
-
-    let fmt = M::mufmt();
-    let mut data = struct_.mudata();
-    let data_clone = data.clone();
-
-    let mut curbyteidx = 0;
-    data.bytes.retain(|(MufieldIdx(idx), _)| {
-        let field = &fmt.fields[*idx];
-        let sz = match &field.sz {
-            SizeData::Exact(n) => *n,
-            SizeData::Unsized(un) => {
-                let sz = (un.size_fn)(&data_clone, &un.mysz);
-                #[cfg(debug_assertions)]
-                {
-                    assert!(match &un.sizes {
-                        AllSizes::Finite(szs) => {
-                            szs.contains(&sz)
-                        }
-                        AllSizes::Infinite => true,
-                    })
-                }
-                sz
+impl<T: MufieldT> MufieldT for Option<T> {
+    fn enc<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        match self {
+            Some(x) => {
+                bool::enc(&true, w)?;
+                T::enc(x, w)
+            },
+            None => {
+                bool::enc(&false, w)
             }
-        };
-        let (n_byte, _) = field.byteidx.iter().enumerate().find(|(_n_byte, MubyteIdx(bx))| *bx == curbyteidx).unwrap();
-        curbyteidx += 1;
-
-        dbg!(sz);
-        dbg!(n_byte);
-        n_byte < sz
-    });
-
-    data.bytes.sort_by(|(a_idx, _), (b_idx, _)| {
-        fmt.fields[a_idx.0]
-            .isz
-            .is_some()
-            .cmp(&fmt.fields[b_idx.0].isz.is_some())
-            .reverse()
-    });
-
-    let mut out = Vec::new();
-    for (_, byte) in data.bytes {
-        out.push(byte);
+        }
     }
 
-    dbg!(&out);
-    out
+    fn dec<R: io::Read>(r: &mut R) -> DecResult<Self> {
+        let flag = bool::dec(r)?;
+        if flag {
+            let x = T::dec(r)?;
+            Ok(Some(x))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl MufieldT for Hello {
+    fn enc<W: io::Write>(&self, w: &mut W) -> io::Result<()> {
+        u8::enc(&self.byte, w)?;
+        Option::<u8>::enc(&self.maybe_exists, w)
+    }
+
+    fn dec<R: io::Read>(r: &mut R) -> DecResult<Self> {
+        let byte = u8::dec(r)?;
+        let maybe_exists = Option::<u8>::dec(r)?;
+        Ok(Self { byte, maybe_exists })
+    }
+}
+
+// TODO: pack functions that return iterator and stack vector
+pub fn pack<T: MufieldT>(v: T) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    v.enc(&mut out)?; 
+    Ok(out)
+}
+
+pub mod conv {
+    pub struct ConstrainedInt<const MAX: u32>(pub u32);
+
+    pub fn i2merge<const A_MAX: u32>(a: ConstrainedInt<A_MAX>, b: u32) -> u32 {
+        // A_MAX=n, B_MAX=m
+        // o=a+(mb)
+        //
+        // a=o%m
+        // b=(o-a)/m
+
+        a.0+(A_MAX*b)
+    }
+
+    pub fn i2split<const B_MAX: u32>(o: u32) -> (u32, u32) {
+        dbg!(o);
+        let a = o % B_MAX;
+        dbg!(a);
+        let b = (o - a) / B_MAX;
+        dbg!(b);
+        (a, b)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn test() {
-        crate::pack(crate::Hello {
+        dbg!(crate::pack(crate::Hello {
             byte: 69,
-            flag: false,
             maybe_exists: Some(2),
-        });
+        }).unwrap());
         eprintln!("Done.");
+    }
+
+    #[test]
+    pub fn i2merge() {
+        let a = 4;
+        let b = 20;
+        let o = crate::conv::i2merge(crate::conv::ConstrainedInt::<5>(a), b);
+        
+        let (a_out, b_out) = crate::conv::i2split::<5>(o);
+        assert_eq!(a, a_out);
+        assert_eq!(b, b_out);
     }
 }
